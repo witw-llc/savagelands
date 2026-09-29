@@ -1,0 +1,167 @@
+# Checks out witw-llc/savage and runs the suite. Triggered by that
+# repository, or by hand. Pull requests against this repository do not
+# run: a pull request here must not receive the checkout token.
+name: ci
+
+on:
+  repository_dispatch:
+    types: [ci]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit on witw-llc/savage
+        required: true
+        type: string
+      event:
+        description: pull_request or push
+        required: true
+        default: pull_request
+        type: string
+      deploy:
+        description: Deploy to Railway after the checks pass
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.client_payload.sha || inputs.sha }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: make check
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+      deploy: ${{ steps.src.outputs.deploy }}
+    steps:
+      - name: Resolve the commit
+        id: src
+        env:
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          DISPATCH_EVENT: ${{ github.event.client_payload.event }}
+          DISPATCH_DEPLOY: ${{ github.event.client_payload.deploy }}
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_EVENT: ${{ inputs.event }}
+          INPUT_DEPLOY: ${{ inputs.deploy }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            echo "sha=$DISPATCH_SHA" >> "$GITHUB_OUTPUT"
+            echo "event=$DISPATCH_EVENT" >> "$GITHUB_OUTPUT"
+            echo "deploy=$DISPATCH_DEPLOY" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
+            echo "event=$INPUT_EVENT" >> "$GITHUB_OUTPUT"
+            if [ "$INPUT_DEPLOY" = "true" ]; then
+              echo "deploy=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: witw-llc/savage
+          ref: ${{ steps.src.outputs.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.SAVAGE_CHECKOUT_TOKEN }}
+          persist-credentials: false
+
+      - name: One build past the base branch
+        if: steps.src.outputs.event == 'pull_request'
+        run: python3 scripts/check-version.py --against origin/main
+
+      - name: One build past the previous commit on main
+        if: steps.src.outputs.event == 'push'
+        run: python3 scripts/check-version.py --against HEAD^
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            Makefile
+
+      - name: Install uv (it runs the ruff version the Makefile pins)
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.15"
+          enable-cache: false
+
+      - name: Install rsvg-convert, Pillow and numpy (for the sprite and sound checks)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q librsvg2-bin python3-pil python3-numpy
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install the npm dev tools (ESLint, Prettier, tsc, markdownlint)
+        run: npm ci
+
+      - run: make check
+
+      - name: Report success
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.SAVAGE_CHECKOUT_TOKEN }}
+          SHA: ${{ steps.src.outputs.sha }}
+        run: |
+          gh api "repos/witw-llc/savage/statuses/${SHA}" \
+            --method POST \
+            -f state=success \
+            -f context='make check' \
+            -f description='make check passed'
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.SAVAGE_CHECKOUT_TOKEN }}
+          SHA: ${{ steps.src.outputs.sha }}
+        run: |
+          gh api "repos/witw-llc/savage/statuses/${SHA}" \
+            --method POST \
+            -f state=failure \
+            -f context='make check' \
+            -f description='make check failed'
+
+  deploy:
+    name: Deploy
+    needs: check
+    if: needs.check.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: witw-llc/savage
+          ref: ${{ needs.check.outputs.sha }}
+          token: ${{ secrets.SAVAGE_CHECKOUT_TOKEN }}
+          persist-credentials: false
+
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          GH_TOKEN: ${{ secrets.SAVAGE_CHECKOUT_TOKEN }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "Set RAILWAY_TOKEN on witw-llc/savagelands (a Railway project token)." >&2
+            gh api "repos/witw-llc/savage/statuses/${SHA}" \
+              --method POST \
+              -f state=failure \
+              -f context=deploy \
+              -f description='RAILWAY_TOKEN is not set'
+            exit 1
+          fi
+          npm install -g @railway/cli
+          railway up --service s1l --ci
+          gh api "repos/witw-llc/savage/statuses/${SHA}" \
+            --method POST \
+            -f state=success \
+            -f context=deploy \
+            -f description='Deployed to Railway'
